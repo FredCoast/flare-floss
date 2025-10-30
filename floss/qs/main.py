@@ -864,38 +864,40 @@ def compute_pe_layout(slice: Slice, xor_key: int | None) -> Layout:
         for offset in structure.slice.range:
             structures_by_address[offset] = structure
 
-    # lancelot only accepts bytes, not mmap
     with timing("lancelot: load workspace"):
         try:
-            ws = lancelot.from_bytes(data)
+            be2 = lancelot.get_binexport2_from_bytes(data)
         except ValueError as e:
             raise ValueError("lancelot failed to load workspace") from e
 
     # contains the file offsets of bytes that are part of recognized instructions.
     code_offsets = set()
     with timing("lancelot: find code"):
-        base_address = ws.base_address
-        for function in ws.get_functions():
-            cfg = ws.build_cfg(function)
-            for bb in cfg.basic_blocks.values():
-                va = bb.address
-                rva = va - base_address
-                try:
-                    offset = pe.get_offset_from_rva(rva)
-                except pefile.PEFormatError as e:
-                    logger.warning("%s", str(e))
-                    continue
+        base_address = lancelot.be2utils.find_be2_base_address(be2)
+        idx = lancelot.be2utils.BinExport2Index(be2)
+        for flow_graph in be2.flow_graph:
+            for basic_block_index in flow_graph.basic_block_index:
+                basic_block = be2.basic_block[basic_block_index]
+                for instruction_index, instruction, instruction_address in idx.basic_block_instructions(basic_block):
+                    va = instruction_address
+                    rva = va - base_address
+                    
+                    try:
+                        offset = pe.get_offset_from_rva(rva)
+                    except pefile.PEFormatError as e:
+                        logger.warning("%s", str(e))
+                        continue
 
-                size = bb.length
+                    size = len(instruction.raw_bytes)
 
-                if not slice.contains_range(offset, size):
-                    logger.warning(
-                        "lancelot identified code at an invalid location, skipping basic block at 0x%x", rva
-                    )
-                    continue
+                    if not slice.contains_range(offset, size):
+                        logger.warning(
+                            "lancelot identified code at an invalid location, skipping instruction at 0x%x", rva
+                        )
+                        continue
 
-                for fo in slice.range.slice(offset, size):
-                    code_offsets.add(fo)
+                    for fo in slice.range.slice(offset, size):
+                        code_offsets.add(fo)
 
     layout = PELayout(
         slice=slice,
