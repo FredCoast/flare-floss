@@ -24,6 +24,8 @@ from pydantic import Field, BaseModel, ConfigDict
 from rich.text import Text
 from rich.style import Style
 from rich.console import Console
+from elftools.elf.elffile import ELFFile
+from elftools.elf.relocation import RelocationSection
 
 import floss.main
 import floss.qs.db.gp
@@ -474,6 +476,22 @@ def get_reloc_offsets(slice: Slice, pe: pefile.PE) -> Set[int]:
 
     return ret
 
+def get_relocations_elf(slice: Slice, elf: ELFFile) -> Set[int]:
+    ret: Set[int] = set()
+
+    for section in elf.iter_sections():
+        if isinstance(section, RelocationSection):
+            offset = section['sh_offset']
+            size = section['sh_size']
+        
+            if not slice.contains_range(offset, size):
+                logger.warning("relocation directory points to an invalid location, skipping")
+                continue
+            
+            for fo in slice.range.slice(offset, size):
+                ret.add(fo)
+    return ret
+
 
 def check_is_xor(xor_key: int | None):
     if isinstance(xor_key, int):
@@ -583,6 +601,24 @@ class Structure(BaseModel):
     slice: Slice
     name: str
 
+def collect_elf_structures(slice: Slice, elf: ELFFile) -> Sequence[Structure]:
+    structures = []
+
+    shstrtab = elf.get_section_by_name('.shstrtab')
+    if shstrtab:
+        structures.append(
+            Structure(
+                slice=slice.slice(shstrtab['sh_offset'],shstrtab['sh_size']),
+                name="structure header",
+            )
+        )
+
+    
+    # TODO:
+    # - implement the .dynamic for libraries
+    # - add a more resilient method for structure headers
+
+    return structures
 
 def collect_pe_structures(slice: Slice, pe: pefile.PE) -> Sequence[Structure]:
     structures = []
@@ -793,7 +829,7 @@ class Layout(BaseModel, abc.ABC):
 class SectionLayout(Layout):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    section: pefile.SectionStructure
+    section: Optional[pefile.SectionStructure] = None
 
 
 class SegmentLayout(Layout):
@@ -843,10 +879,98 @@ class PELayout(Layout):
                 # which is fine - but we don't expect it to know about the PE structures.
                 child.mark_structures(structures=structures, **kwargs)
 
+class ELFLayout(Layout):
+    # xor key is the file was xor decoded
+    xor_key: Optional[int]
+
+    # file offsets of bytes that are part of .rela files
+    relocation_offsets: Set[int]
+
+    # file offsets of bytes that are recognised as code
+    code_offsets: Set[int]
+
+    structures_by_address: Dict[int, Structure]
+
+    def tag_strings(self, taggers: Sequence[Tagger]):
+        def check_is_xor_tagger(s: ExtractedString) -> Sequence[Tag]:
+            return check_is_xor(self.xor_key)
+
+        def check_is_reloc_tagger(s: ExtractedString) -> Sequence[Tag]:
+            return check_is_reloc(self.relocation_offsets, s)
+
+        def check_is_code_tagger(s: ExtractedString) -> Sequence[Tag]:
+            return check_is_code(self.code_offsets, s)
+        
+        taggers = tuple(taggers) + (
+            check_is_xor_tagger,
+            check_is_reloc_tagger,
+            check_is_code_tagger,
+        )
+
+        super().tag_strings(taggers)
+    
+    def mark_structures(self, structures = (), **kwargs):
+        for child in self.children:
+            if isinstance(child, (SectionLayout, SegmentLayout)):
+                child.mark_structures(structures=structures + (self.structures_by_address,), **kwargs)
+            else:
+                child.mark_structures(structures=structures, **kwargs)
 
 class ResourceLayout(Layout):
     pass
 
+def compute_elf_layout(slice: Slice, xor_key: int | None) -> Layout:
+    data = slice.data
+
+    elf = ELFFile(io.BytesIO(data))
+
+    structures = collect_elf_structures(slice, elf)
+    relocation_offsets = get_relocations_elf(slice, elf)
+
+    structures_by_address = {}
+    for structure in structures:
+        for offset in structure.slice.range:
+            structures_by_address[offset] = structure
+
+    # TODO:
+    # Lancelot for code offset
+
+    code_offsets = set()
+
+    layout = ELFLayout(
+        slice=slice,
+        name="elf",
+        xor_key=xor_key,
+        relocation_offsets=relocation_offsets,
+        code_offsets=code_offsets,
+        structures_by_address=structures_by_address,
+    )
+
+    if xor_key:
+        layout.name += f" (XOR decoded with key: 0x{xor_key:x})"
+    try:
+        for section in elf.iter_sections():
+            if section['sh_size'] == 0:
+                continue
+
+            name = section.name
+            offset = section['sh_offset']
+            size = section['sh_size']
+
+            if offset > slice.range.end:
+                logger.warning("section %s out of range", name)
+                continue
+
+            if offset + size > slice.range.length:
+                size_orig = size
+                size = slice.range.length - offset
+                assert size >= 0
+                logger.warning("section size %s out of range, truncating from 0x%x to 0x%x bytes", name, size_orig, size)
+
+            layout.add_child(SectionLayout(slice=slice.slice(offset, size), name=name))
+    except Exception as e:
+        print(e)
+    return layout
 
 def compute_pe_layout(slice: Slice, xor_key: int | None) -> Layout:
     data = slice.data
@@ -1081,6 +1205,15 @@ def compute_layout(slice: Slice) -> Layout:
             return compute_pe_layout(decoded_slice, xor_key)
         except ValueError as e:
             logger.debug("failed to parse as PE file: %s", e)
+            # Fall back to using the default binary layout
+            pass
+
+    # Try to parse as ELF file
+    if decoded_slice.data.startswith(b"\x7fELF"):
+        try:
+            return compute_elf_layout(decoded_slice, xor_key)
+        except ValueError as e:
+            logger.debug("failed to parse as ELF file: %s", e)
             # Fall back to using the default binary layout
             pass
 
